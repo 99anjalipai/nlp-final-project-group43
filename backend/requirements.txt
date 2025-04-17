@@ -1,0 +1,9 @@
+flask==2.2.3
+flask-cors==3.0.10
+yt-dlp==2023.3.4
+openai-whisper==20230314
+nltk==3.8.1
+transformers==4.29.0
+torch==2.0.0
+rouge-score==0.1.2
+uuid
