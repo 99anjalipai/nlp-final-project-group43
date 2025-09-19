@@ -1,24 +1,19 @@
-# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os
+import os, re, time, uuid, threading
 import yt_dlp
 import whisper
-import re
 import nltk
 from nltk.tokenize import sent_tokenize
-from transformers import pipeline
-import uuid
 from rouge_score import rouge_scorer
-import threading
-import time
+
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 os.environ["PATH"] += os.pathsep + r"D:\NLP\ffmpeg-7.0.2-essentials_build\bin"
 
 
 # Download NLTK resources
 nltk.download('punkt')
-nltk.download('punkt_tab')
 
 
 app = Flask(__name__)
@@ -29,27 +24,102 @@ os.makedirs("downloads", exist_ok=True)
 os.makedirs("transcripts", exist_ok=True)
 os.makedirs("summaries", exist_ok=True)
 
-# Global variables
-summarizer = None
+MODEL_NAME = "sshleifer/distilbart-cnn-12-6"
+
+tokenizer = None
+summ_model = None
 whisper_model = None
-job_status = {}  # Track status of async jobs
+models_ready = threading.Event()  # set when loader finishes
+
+# Token/window config (stay under 1024; keep headroom)
+MAX_SOURCE_TOKENS = 960
+CHUNK_OVERLAP_TOKENS = 96
+
+GEN_ARGS = dict(
+    max_length=180,          # per-chunk output length
+    min_length=60,
+    num_beams=4,
+    no_repeat_ngram_size=3,
+    length_penalty=1.05
+)
+
+job_status = {}
 
 def load_models():
-    global summarizer, whisper_model
-    print("Loading summarization model...")
-    summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-    print("Loading Whisper model...")
-    whisper_model = whisper.load_model("base")
-    print("Models loaded successfully")
+    """Load HF summarizer and Whisper once at startup."""
+    global tokenizer, summ_model, whisper_model
+    try:
+        print("Loading summarization model...")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+        summ_model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+        print("Loading Whisper model...")
+        whisper_model = whisper.load_model("base")  # or "small.en"/"medium"
+        print("Models loaded successfully.")
+    except Exception as e:
+        print(f"❌ Model load failed: {e}")
+    finally:
+        models_ready.set()
 
 # Load models in a separate thread at startup
-threading.Thread(target=load_models).start()
+threading.Thread(target=load_models, daemon=True).start()
 
 def clean_text(text):
     """Clean the text by removing extra spaces and filler words"""
     text = re.sub(r"\s+", " ", text)
     text = text.replace("uh", "").replace("um", "")
     return text.strip()
+
+def _encode(text: str):
+    return tokenizer(text, add_special_tokens=False).input_ids
+
+def _decode(ids):
+    return tokenizer.decode(ids, skip_special_tokens=True)
+
+def chunk_by_tokens(text: str,
+                    max_tokens: int = MAX_SOURCE_TOKENS,
+                    overlap: int = CHUNK_OVERLAP_TOKENS):
+    """Token-aware sliding window chunking."""
+    ids = _encode(text)
+    if not ids:
+        return []
+    chunks, start = [], 0
+    step = max(max_tokens - overlap, 1)
+    while start < len(ids):
+        end = min(start + max_tokens, len(ids))
+        chunks.append(_decode(ids[start:end]))
+        if end == len(ids):
+            break
+        start += step
+    return chunks
+
+def summarize_block(text: str) -> str:
+    """Summarize a single block safely within token limits."""
+    enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_SOURCE_TOKENS)
+    out = summ_model.generate(**enc, **GEN_ARGS)
+    return tokenizer.decode(out[0], skip_special_tokens=True).strip()
+
+def hierarchical_summarize(long_text: str) -> str:
+    """Chunk → summarize each → merge → second-hop summarize."""
+    chunks = chunk_by_tokens(long_text)
+    if not chunks:
+        return ""
+    if len(chunks) == 1:
+        return summarize_block(chunks[0])
+
+    part_summaries = [summarize_block(c) for c in chunks]
+    combined = " ".join(part_summaries)
+
+    # If combined is still long, do a quick hop
+    if len(_encode(combined)) > MAX_SOURCE_TOKENS:
+        hop_chunks = chunk_by_tokens(combined)
+        hop_sums = [summarize_block(c) for c in hop_chunks]
+        combined2 = " ".join(hop_sums)
+        if len(_encode(combined2)) > MAX_SOURCE_TOKENS:
+            return summarize_block(combined2)
+        return combined2
+    else:
+        # one more pass for coherence
+        return summarize_block(combined)
 
 def download_video(video_url, job_id):
     """Download video using yt-dlp"""
@@ -95,53 +165,34 @@ def transcribe_video(video_path, job_id):
 
 def generate_summary(transcript, job_id):
     """Generate summary from transcript"""
-    try:
-        job_status[job_id]['status'] = 'summarizing'
+    job_status[job_id]['status'] = 'summarizing'
         
-        # Wait for model to load if needed
-        while summarizer is None:
-            time.sleep(1)
+    models_ready.wait()
+
+    if tokenizer is None or summ_model is None:
+        raise RuntimeError("Summarization model not available")
             
-        cleaned_transcript = clean_text(transcript)
+    cleaned_transcript = clean_text(transcript)
         
-        # Break transcript into chunks
-        sentences = sent_tokenize(cleaned_transcript)
-        chunks = []
-        current_chunk = ""
-
-        for sentence in sentences:
-            if len(current_chunk) + len(sentence) < 1000:
-                current_chunk += " " + sentence
-            else:
-                chunks.append(current_chunk.strip())
-                current_chunk = sentence
-                
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-
-        # Summarize each chunk
+    if len(_encode(cleaned_transcript)) <= MAX_SOURCE_TOKENS:
+        final_summary = summarize_block(cleaned_transcript)
+    else:
+        chunks = chunk_by_tokens(cleaned_transcript)
         summaries = []
-        for i, chunk in enumerate(chunks):
-            job_status[job_id]['progress'] = f"Summarizing chunk {i+1}/{len(chunks)}"
-            result = summarizer(chunk, max_length=130, min_length=30, do_sample=False)
-            summaries.append(result[0]['summary_text'])
-
-        # Create final summary
-        if len(summaries) > 1:
-            combined_summaries = " ".join(summaries)
-            final_summary = summarizer(combined_summaries, max_length=250, min_length=100, do_sample=False)[0]['summary_text']
+        for i, ch in enumerate(chunks, 1):
+            job_status[job_id]["progress"] = f"Summarizing chunk {i}/{len(chunks)}"
+            summaries.append(summarize_block(ch))
+        merged = " ".join(summaries)
+        if len(_encode(merged)) > MAX_SOURCE_TOKENS:
+            final_summary = hierarchical_summarize(merged)
         else:
-            final_summary = summaries[0]
-            
-        # Save summary
-        summary_path = f"summaries/{job_id}.txt"
-        with open(summary_path, "w", encoding="utf-8") as f:
-            f.write(final_summary.strip())
-            
-        return final_summary.strip()
-    except Exception as e:
-        job_status[job_id]['error'] = f"Error generating summary: {str(e)}"
-        raise
+            final_summary = summarize_block(merged)
+
+    # Save
+    with open(f"summaries/{job_id}.txt", "w", encoding="utf-8") as f:
+        f.write(final_summary.strip())
+
+    return final_summary.strip()
 
 def process_video(video_url, job_id):
     try:
@@ -169,8 +220,8 @@ def process_video(video_url, job_id):
 @app.route('/api/summarize', methods=['POST'])
 def start_summarization():
     """Start the summarization process"""
-    data = request.json
-    video_url = data.get('videoUrl')
+    data = request.json or {}
+    video_url = data.get('videoUrl') 
     
     if not video_url:
         return jsonify({'error': 'Video URL is required'}), 400
@@ -185,7 +236,7 @@ def start_summarization():
     }
     
     # Start processing in a separate thread
-    threading.Thread(target=process_video, args=(video_url, job_id)).start()
+    threading.Thread(target=process_video, args=(video_url, job_id), daemon=True).start()
     
     return jsonify({
         'jobId': job_id,
